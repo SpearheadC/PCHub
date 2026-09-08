@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="es"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SOP · Spearhead Construction</title>
+<link rel="preconnect" href="https://fonts.googleapis.com/">
+<link rel="preconnect" href="https://fonts.gstatic.com/" crossorigin="">
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800;900&amp;family=Space+Mono:wght@400;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body id="artifacts-component-root-html">
+
+<!-- ===================== CREAR CHANGE ORDER (modal) ===================== -->
+<div id="coModalOverlay" class="co-overlay" aria-hidden="true">
+  <div class="co-modal" role="dialog" aria-modal="true" aria-labelledby="coModalTitle">
+    <div class="co-modal-head">
+      <div>
+        <span class="kicker" style="margin-bottom:6px;display:inline-block">Templates</span>
+        <h2 id="coModalTitle">Crear Change Order</h2>
+      </div>
+      <button type="button" id="coModalClose" class="co-close" aria-label="Cerrar">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+      </button>
+    </div>
+
+    <div class="co-modal-body">
+      <label class="co-label" for="coTemplateSelect">Template</label>
+      <select id="coTemplateSelect" class="co-select">
+        <option value="">Selecciona un template…</option>
+      <option value="msgTemplates">Change Order Templates</option><option value="tplCompletion">Completion Message</option><option value="tplProposalFollowup">Proposal Follow-up</option><option value="tplProposal">Proposal Template</option><option value="tplPrelimNotice">Preliminary Notice Email</option></select>
+
+      <div id="coSubtypeWrap" style="display:none;margin-top:14px">
+        <label class="co-label" for="coSubtypeSelect">Tipo</label>
+        <select id="coSubtypeSelect" class="co-select">
+          <option value="">Selecciona el tipo…</option>
+        </select>
+      </div>
+
+      <div id="coProjectWrap" style="display:none;margin-top:14px">
+        <label class="co-label" for="coProjectSearch">Proyecto</label>
+        <div class="co-search-wrap">
+          <svg class="co-search-ico" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path></svg>
+          <input type="text" id="coProjectSearch" class="co-select co-search-input" placeholder="Buscar proyecto o cliente…" autocomplete="off">
+          <svg class="co-chev-ico" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M6 9l6 6 6-6"></path></svg>
+        </div>
+        <div id="coProjectList" class="co-project-list" style="display:none"></div>
+      </div>
+
+      <div id="coClientInfo" class="co-client-info" style="display:none">
+        <span id="coClientName"></span>
+        <span id="coClientAddress" class="co-address"></span>
+        <span id="coClientLang" class="co-lang-badge"></span>
+      </div>
+
+      <div id="coMsgWrap" class="co-msg-wrap" style="display:none">
+        <button type="button" id="coCopyBtn" class="ml-copy" style="position:absolute" title="Copiar mensaje">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+          <span>Copiar</span>
+        </button>
+        <pre id="coMsgText" class="ml-msg" contenteditable="true"></pre>
+      </div>
+      <p id="coEmptyState" class="co-empty">Elegí un template arriba para continuar.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SCHEDULE AN INSPECTION (modal) ===================== -->
+<div id="inspModalOverlay" class="co-overlay" aria-hidden="true">
+  <div class="co-modal" role="dialog" aria-modal="true" aria-labelledby="inspModalTitle">
+    <div class="co-modal-head">
+      <div>
+        <span class="kicker" style="margin-bottom:6px;display:inline-block">Permits</span>
+        <h2 id="inspModalTitle">Schedule an Inspection</h2>
+      </div>
+      <button type="button" id="inspModalClose" class="co-close" aria-label="Cerrar">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+      </button>
+    </div>
+
+    <div class="co-modal-body">
+      <label class="co-label" for="inspProjectSearch">Proyecto</label>
+      <div class="co-search-wrap">
+        <svg class="co-search-ico" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path></svg>
+        <input type="text" id="inspProjectSearch" class="co-select co-search-input" placeholder="Buscar proyecto o cliente…" autocomplete="off">
+        <svg class="co-chev-ico" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M6 9l6 6 6-6"></path></svg>
+      </div>
+      <div id="inspProjectList" class="co-project-list" style="display:none"></div>
+
+      <div id="inspResult" style="margin-top:16px;display:none"></div>
+      <div id="inspEmptyState" style="margin-top:16px;font-size:12.5px;color:var(--gray)">Selecciona un proyecto para ver sus permisos (PMT) cargados desde el Binder.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== CREATE VENDOR REQUEST (modal) ===================== -->
+<div id="vendorModalOverlay" class="co-overlay" aria-hidden="true">
+  <div class="co-modal" role="dialog" aria-modal="true" aria-labelledby="vendorModalTitle">
+    <div class="co-modal-head">
+      <div>
+        <span class="kicker" style="margin-bottom:6px;display:inline-block">Templates</span>
+        <h2 id="vendorModalTitle">Create Vendor Request</h2>
+      </div>
+      <button type="button" id="vendorModalClose" class="co-close" aria-label="Cerrar">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+      </button>
+    </div>
+
+    <div class="co-modal-body">
+      <label class="co-label" for="vendorTypeSelect">Tipo de vendor</label>
+      <select id="vendorTypeSelect" class="co-select">
+        <option value="">Selecciona un tipo…</option>
+        <option value="row">ROW</option>
+        <option value="fire">Fire Sprinklers</option>
+        <option value="solar">Solar System</option>
+        <option value="hers">HERS</option>
+        <option value="homeinspection">Home Inspection</option>
+        <option value="other">Otros</option>
+      </select>
+
+      <div id="vendorRowWrap" style="display:none;margin-top:14px">
+        <label class="co-label" for="vendorRowSelect">¿Hay planos de ROW?</label>
+        <select id="vendorRowSelect" class="co-select">
+          <option value="">Selecciona…</option>
+          <option value="yes">Sí, hay planos de ROW</option>
+          <option value="no">No, solo building plans</option>
+        </select>
+      </div>
+
+      <div id="vendorOtherWrap" style="display:none;margin-top:14px">
+        <label class="co-label" for="vendorOtherInput">Disciplina</label>
+        <input type="text" id="vendorOtherInput" class="co-select" placeholder="Ej. Landscaping, HVAC…" autocomplete="off">
+      </div>
+
+      <div id="vendorProjectWrap" style="display:none;margin-top:14px">
+        <label class="co-label" for="vendorProjectSearch">Proyecto</label>
+        <div class="co-search-wrap">
+          <svg class="co-search-ico" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path></svg>
+          <input type="text" id="vendorProjectSearch" class="co-select co-search-input" placeholder="Buscar proyecto o cliente…" autocomplete="off">
+          <svg class="co-chev-ico" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M6 9l6 6 6-6"></path></svg>
+        </div>
+        <div id="vendorProjectList" class="co-project-list" style="display:none"></div>
+      </div>
+
+      <div id="vendorMsgWrap" class="co-msg-wrap" style="display:none">
+        <button type="button" id="vendorCopyBtn" class="ml-copy" style="position:absolute" title="Copiar mensaje">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+          <span>Copiar</span>
+        </button>
+        <pre id="vendorMsgText" class="ml-msg" contenteditable="true"></pre>
+      </div>
+      <div id="vendorContactsWrap" style="display:none"></div>
+      <p id="vendorEmptyState" class="co-empty">Elegí el tipo de vendor arriba para continuar.</p>
+    </div>
+  </div>
+</div>
+
+<div id="pcModalOverlay" class="co-overlay" aria-hidden="true">
+  <div class="co-modal" role="dialog" aria-modal="true" aria-labelledby="pcModalTitle" style="max-width:420px">
+    <div class="co-modal-head">
+      <div>
+        <span class="kicker" style="margin-bottom:6px;display:inline-block">Personal</span>
+        <h2 id="pcModalTitle">¿Quién sos?</h2>
+      </div>
+      <button type="button" id="pcModalClose" class="co-close" aria-label="Cerrar" style="display:none">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+      </button>
+    </div>
+    <div class="co-modal-body">
+      <div class="co-field">
+        <label class="co-label" for="pcSelect">Elegí tu nombre como Project Coordinator</label>
+        <div class="pc-select-wrap">
+          <select id="pcSelect" class="pc-select"></select>
+        </div>
+      </div>
+      <p id="pcModalHint" style="font-size:12px;color:var(--gray);margin-top:10px">Esto define qué proyectos ves en tu página Personal. Podés cambiarlo cuando quieras desde ahí.</p>
+    </div>
+    <div class="co-modal-foot">
+      <button type="button" id="pcConfirmBtn" class="co-btn-primary">Confirmar</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== LANDING ===================== -->
+<section class="view active" id="landing">
+  <div class="lp-head">
+    <div class="brand">
+      <div class="mark"><img src="assets/sdge/logo-brand.png" alt="Spearhead" style="width:100%;height:100%;object-fit:cover;border-radius:8px"></div>
+      <div class="name">Spearhead<small>PC Operations Hub</small></div>
+    </div>
+    <span class="tag2">INTERNAL USE</span>
+  </div>
+
+  <div class="lp-hero">
+    <span class="eyebrow">Project Coordination</span>
+    <h1>¿Qué necesitas <em>hacer</em> hoy?</h1>
+    <p class="lead">Procesos, herramientas, templates y recursos para manejar un proyecto de principio a fin.</p>
+    <div class="lp-search">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path></svg>
+      <input type="text" id="gSearch" placeholder="Buscá un proceso, herramienta, template o tema…" autocomplete="off" aria-label="Buscar un proceso, herramienta, template o tema">
+      <span class="lp-kbd">⌘K</span>
+      <div class="lp-results" id="gResults"></div>
+    </div>
+  </div>
+
+  <div class="lp-wrap" id="homeGrid">
+    <div class="lp-sec">
+      <div class="lp-sec-h"><h2>Seguí un proceso</h2>
+        <span class="hint">Guía paso a paso, desde el primer contacto hasta el cierre del proyecto.</span></div>
+      <div class="lp-flows"><button class="lp-flow a" data-go="solutions">
+    <span class="fk">9 procesos</span>
+    <h3>Solutions</h3>
+    <div class="fd">Planos, permisos y timeline de diseño con la ciudad.</div>
+    <div class="lp-chips"><span class="lp-chip">Design</span><span class="lp-chip">Plans</span><span class="lp-chip">Permits</span><span class="lp-chip">Pre-Construction</span></div>
+    <div class="ff"><span class="fcta">Ver workflow</span>
+      <span class="fgo"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></span>
+    </div>
+  </button><button class="lp-flow b" data-go="construction">
+    <span class="fk">11 procesos</span>
+    <h3>Construction</h3>
+    <div class="fd">Contrato, binder, vendors y ejecución en campo.</div>
+    <div class="lp-chips"><span class="lp-chip">Contract</span><span class="lp-chip">Setup</span><span class="lp-chip">Vendors</span><span class="lp-chip">Schedule</span><span class="lp-chip">Closeout</span></div>
+    <div class="ff"><span class="fcta">Ver workflow</span>
+      <span class="fgo"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></span>
+    </div>
+  </button></div>
+    </div>
+
+    <div class="lp-sec">
+      <div class="lp-sec-h"><h2>Top Links</h2>
+        <span class="hint">Accesos directos a lo que más usas.</span></div>
+      <div class="lp-qa"><button class="qa2" data-external="https://docs.google.com/forms/d/e/1FAIpQLSfeWTcG2iAq-sxD_L5VGPPI2ZY2mLf25zG5bNDvRhDKacPMfQ/viewform">
+      <svg viewBox="0 0 24 24"><path d="M7 4 3 8l4 4M3 8h14M17 20l4-4-4-4M21 16H7"></path></svg><span>Change Order Form</span></button><button class="qa2" data-go="cityaccess">
+    <svg viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="9" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path></svg><span>Credenciales y Links de la Ciudad</span></button><button class="qa2" data-external="https://spearhead.ngmanagements.com/dashboard">
+      <svg viewBox="0 0 24 24"><path d="M3 7h11v8H3zM14 10h4l3 3v2h-7z"></path><circle cx="7" cy="18" r="1.6"></circle><circle cx="17" cy="18" r="1.6"></circle></svg><span>Spearhead Hub</span></button><button class="qa2" data-go="sdge">
+    <svg viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7z"></path></svg><span>SDG&amp;E Coordination</span></button></div>
+    </div>
+
+    <div class="lp-sec">
+      <div class="lp-sec-h"><h2>Acciones rápidas</h2>
+        <span class="hint">Ve directo a la tarea que ya conoces.</span></div>
+      <div class="lp-qa"><button class="qa2" data-open-insp="1">
+      <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M8 3v4M16 3v4M8 14l3 3 5-5"></path></svg><span>Schedule an Inspection / Track a Permit</span></button><button class="qa2" data-go="construction" data-open="9">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M8 12.5l2.5 2.5L16 9.5"></path></svg><span>Close a Project</span></button><button class="qa2" data-create="1">
+      <svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"></path><path d="M14 3v5h5M9 13h6M9 17h6"></path></svg><span>Create Client Message</span></button><button class="qa2" data-open-vendor="1">
+      <svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"></path><path d="M14 3v5h5M9 13h6M9 17h6"></path></svg><span>Create Vendor Request</span></button></div>
+    </div>
+
+    <div class="lp-sec">
+      <div class="lp-sec-h"><h2>Encontrá información</h2></div>
+      <div class="lp-find">
+        <button class="lp-fc " data-go="wiki">
+    <span class="qq">¿Cómo hago esto?</span>
+    <h3>Project Wiki</h3><p>Procesos, procedimientos y guías de referencia.</p>
+    <span class="fcgo">Abrir la wiki →</span></button>
+        <button class="lp-fc alt" data-go="resourceshub">
+    <span class="qq">¿Dónde está lo que necesito?</span>
+    <h3>Resources</h3><p>Templates, credenciales, directorio y links de proyecto.</p>
+    <span class="fcgo">Ver recursos →</span></button>
+      </div>
+    </div>
+
+    <div class="lp-life">
+      <div class="lp-sec-h" style="margin-bottom:0"><h2 style="font-size:11px;font-family:&#39;Space Mono&#39;,monospace;letter-spacing:.2em;text-transform:uppercase;color:#7a7a7a;font-weight:400">Ciclo de vida del proyecto</h2></div>
+      <div class="lp-track"><button class="lp-stage" data-go="solutions"><span class="d"></span>Solutions</button><span class="lp-rail"></span><button class="lp-stage" data-go="permits"><span class="d"></span>Permits</button><span class="lp-rail"></span><button class="lp-stage" data-go="solutions" data-open="6"><span class="d"></span>Pre-Construction</button><span class="lp-rail"></span><button class="lp-stage" data-go="construction"><span class="d"></span>Construction</button><span class="lp-rail"></span><button class="lp-stage" data-go="cityaccess"><span class="d"></span>Inspections</button><span class="lp-rail"></span><button class="lp-stage" data-go="construction" data-open="9"><span class="d"></span>Closeout</button></div>
+    </div>
+
+    <div class="lp-foot">
+      <span class="fl">Spearhead Construction · PC Operations Hub · Uso interno</span>
+      <div class="fr">
+        <span>Última actualización: <span id="lastUpd">28 de agosto de 2026</span></span>
+        <a href="https://forms.monday.com/forms/dad5728bde2a3c7fb4da39dc4122f6fc?r=use1" target="_blank" rel="noopener">¿Falta algo o está desactualizado? Sugerí un cambio →</a>
+      </div>
+    </div></div>
+</section>
+
+<!-- ===================== SECTION ===================== -->
+<section class="view" id="section">
+  <div class="sec-top">
+    <button class="back" id="back"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M19 12H5M11 6l-6 6 6 6"></path></svg>Inicio</button>
+    <button class="back" id="homeBtn" title="Ir al inicio"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 11l9-8 9 8M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"></path></svg>Inicio</button>
+    <span class="here">SOP · <b id="hereName">—</b></span>
+    <div class="sec-search">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path></svg>
+      <input type="text" id="search" placeholder="Buscar…" autocomplete="off">
+    </div>
+  </div>
+  <div class="sec-hero" id="secHero"></div>
+  <div class="wrap"><div id="secBody"></div></div>
+</section>
+
+<script src="data/links.js"></script>
+<script src="data/projects.js"></script>
+<script src="data/groups-templates.js"></script>
+<script src="data/groups-construction.js"></script>
+<script src="data/groups-sdge.js"></script>
+<script src="data/groups-merge.js"></script>
+<script src="data/creds.js"></script>
+<script src="data/reference.js"></script>
+<script src="data/sections.js"></script>
+<script src="app/utils.js"></script>
+<script src="app/render.js"></script>
+<script src="app/home.js"></script>
+<script src="app/search-router.js"></script>
+<script src="app/pc.js"></script>
+<script src="app/modals.js"></script>
+
+
+</body></html>
